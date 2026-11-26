@@ -1,0 +1,146 @@
+apiVersion: sourceplane.io/v1
+kind: Component
+metadata:
+  name: web
+  description: The team chat (Next.js on Cloudflare Workers + Static Assets via @opennextjs/cloudflare, per environment)
+spec:
+  type: cloudflare-workers-assets-turbo
+  lifecycle: production
+  owner: platform
+  # Its pages, attached to it in the workspace's catalog: what the Docs
+  # library shows for it, and what the catalog's docs and runbook checks read.
+  # Generated from what this manifest and its sources declare.
+  docs:
+    overview: docs/overview.md
+    pages:
+      - { path: docs/architecture.md, role: architecture, title: Architecture }
+      - { path: docs/runbook.md, role: runbook, title: Runbook }
+  # `app`, not `web`: a domain and a component share one name space in the
+  # catalog, and a domain called `web` hid this component from it.
+  domain: app
+  path: apps/web
+  # Its own lane per environment: the Next.js build is the longest job in the
+  # plan, and a shared lane would wait on it.
+  lane: isolated
+  # INFRA BEFORE APP. The Worker's config carries its project's URL and anon
+  # key, rendered in the build from the wiring document the `supabase` root
+  # lease-publishes after its apply, and the browser reads the tables — and
+  # signs in through the access-token hook — that db-migrate creates and
+  # enables in that project. A job resolves its secrets when it STARTS, so on
+  # a merge to main this deploy waits for both (enforced) — one convergence
+  # runs supabase → db-migrate → web per environment, and the document and the
+  # schema are there. A pull request deploys nothing, so nothing on one waits
+  # (advisory).
+  dependsOn:
+    - component: supabase
+      mode: enforced
+      modeRules:
+        - mode: advisory
+          when:
+            triggerRef: github-pull-request
+    - component: db-migrate
+      mode: enforced
+      modeRules:
+        - mode: advisory
+          when:
+            triggerRef: github-pull-request
+  # The wiring documents the supabase root lease-publishes, one per deployed
+  # environment: the project's URL and publishable (anon) key, rendered into
+  # wrangler.jsonc by the build and inlined into the bundle;
+  # tooling/wire/live.mjs picks this job's and fails loudly when it is not
+  # there. OPTIONAL references, so a job resolves the ones that exist: stage's
+  # deploy waits on stage's chain only, and while the bootstrap runs stage and
+  # prod side by side, prod's document may not be published yet when stage's
+  # deploy starts (a required reference would fail that job). The dev verify
+  # lane renders nothing and reads neither. The chat needs no server secret:
+  # the browser talks to Supabase with the publishable key, and row-level
+  # security is what protects the data.
+  optionalSecretEnv:
+    WIRING_SUPABASE_STAGE: "secret://supabase-slack-clone/supabase-slack-clone/stage/WIRING_SUPABASE"
+    WIRING_SUPABASE_PROD: "secret://supabase-slack-clone/supabase-slack-clone/prod/WIRING_SUPABASE"
+  subscribe:
+    environments:
+      - name: dev
+        profile: verify
+      - name: stage
+        profile: verify
+        profileRules:
+          - profile: deploy
+            when:
+              triggerRef: github-push-main
+      - name: prod
+        profile: verify
+        profileRules:
+          - profile: deploy
+            when:
+              triggerRef: github-push-main
+  # How the app runs itself for orun.work's live Preview tab
+  # (saas-parallel-baselining PB4): `orun preview` starts this, and a coding
+  # session keeps it running while it works, so the person watches it change
+  # as it is built. The dev server binds the box's loopback only, on a fixed
+  # port, and installs first, so a checkout the session has not installed yet
+  # still comes up.
+  # It installs only this app's packages and runs `next dev` alone, with its
+  # heap capped: the box is shared with the agent. `next dev` reads the
+  # Supabase project from .env.local, and lib/Store.js's client throws at
+  # import without one, so until a session writes that file the preview starts
+  # on .env.example's placeholders (the Supabase CLI's local URL, where
+  # nothing listens, and no key): the sign-in page comes up, and signing in
+  # waits for a real project. A .env.local, or the variables already set, win.
+  preview:
+    run:
+      - sh
+      - -c
+      - pnpm install --frozen-lockfile --prefer-offline --filter "@app/web..." && if [ ! -f .env.local ]; then export NEXT_PUBLIC_SUPABASE_URL="${NEXT_PUBLIC_SUPABASE_URL:-http://127.0.0.1:54321}" NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY="${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:-your-publishable-key}"; fi && exec node_modules/.bin/next dev -H 127.0.0.1 -p 3000
+    port: 3000
+    path: /
+    env:
+      NODE_OPTIONS: --max-old-space-size=1024
+      NEXT_TELEMETRY_DISABLED: "1"
+  parameters:
+    nodeVersion: "22"
+    pnpmVersion: "10.12.1"
+
+    workspaceDir: ../..
+    appDir: .
+
+    turboFilter: "@app/web"
+    wranglerConfig: wrangler.jsonc
+
+    # @opennextjs/cloudflare emits a Worker entrypoint plus a static-assets
+    # directory bound via ASSETS — both deploy in one `wrangler deploy`.
+    workerEntrypoint: .open-next/worker.js
+    assetsDir: .open-next/assets
+
+    # Per-env worker name: supabase-slack-clone-web-{dev,stage,prod}.
+    workerName: supabase-slack-clone-web
+    environmentAwareWorkerName: true
+
+    # The account's workers.dev subdomain; exported to the smoke step as
+    # ${WORKERS_DEV_SUBDOMAIN} and used to build ${DEPLOYED_URL}. The supabase
+    # root carries the same value: Auth's Site URL is this Worker.
+    workersDevSubdomain: vijayakrishnan12994
+
+    installCommand: pnpm install --frozen-lockfile
+    # wrangler.jsonc is COMMITTED — the fixture render, so the composition's
+    # structure check (`test -f wrangler.jsonc`, before the build, in a fresh
+    # checkout) passes. Stage and prod re-render it here, in their own job
+    # tree, from this environment's wiring document, so the Worker's vars and
+    # the URL and key `next build` inlines (next.config.ts) are the real
+    # project's; dev verifies with the fixture and has no wiring.
+    # ${ORUN_ENVIRONMENT} the runner sets for every step.
+    buildCommand: if [ "${ORUN_ENVIRONMENT}" != dev ]; then node ../../tooling/wire/live.mjs --template wrangler.template.jsonc --out wrangler.jsonc --components supabase --env "${ORUN_ENVIRONMENT}"; fi && pnpm exec turbo run build --filter=@app/web
+
+    # Smoke: the sign-in page renders, its password field included, and /api/health
+    # answers ok — which only the Worker can, by asking the project's Auth with
+    # the key this build inlined and asking its Data API for the `channels`
+    # table the migrations create, so it proves the project bound and
+    # migrated. Read-only: an anonymous caller gets no rows. Each response is
+    # buffered before grep so an early match cannot SIGPIPE curl.
+    smokeCommand: "html=$(curl -sfL \"${DEPLOYED_URL}/\") && echo \"${html}\" | grep -q 'type=\"password\"' && health=$(curl -sf \"${DEPLOYED_URL}/api/health\") && echo \"${health}\" | grep -q '\"ok\":true'"
+  labels:
+    team: platform
+    layer: delivery
+    surface: web
+    runtime: cloudflare
+# orun: redeploy 01-product as_4e3c9a6ee7c94599a30d
